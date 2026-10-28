@@ -22,6 +22,10 @@ env:
   # cc23x0r5 radio microcode/settings are read (as data) by zigbee-mac's
   # build script; no TI C code is compiled or linked.
   CC2340_SDK_COMMIT: 68ca021502383f367d0bf2a5517fdd0dcb0ef909
+  # MCUboot v2.1.0: source of the public sample key root-ec-p256.pem that
+  # TI's SDK and koptserg's MCUboot trust (the `migrate` OTA channel).
+  MCUBOOT_COMMIT: 9c99326b9756dbcc35b524636d99ed5f3e6cb29b
+  IMGTOOL_VERSION: 2.4.0
 
 jobs:
   host:
@@ -47,17 +51,20 @@ jobs:
       - name: Clippy
         run: |
           cargo clippy --locked --all-targets \
-            -p flower-cc2340r5 -p cc2340-flower-product \
+            -p flower-cc2340r5 -p flower-layout -p cc2340-flower-product \
             --no-default-features --features cc2340-flower-product/${{ matrix.calibration }} \
             -- -D warnings
       - name: Test
         run: |
           cargo test --locked \
-            -p flower-cc2340r5 -p cc2340-flower-product \
+            -p flower-cc2340r5 -p flower-layout -p cc2340-flower-product \
             --no-default-features --features cc2340-flower-product/${{ matrix.calibration }}
+      - name: Test release tooling
+        if: matrix.calibration == 'koptserg'
+        run: python3 -m unittest discover -s tools -v
 
   firmware:
-    name: Firmware
+    name: Bootloader, firmware and OTA files
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -69,7 +76,51 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-targets: false
-          key: thumbv6m-flower-${{ env.RUST_TOOLCHAIN }}-sdk-${{ env.CC2340_SDK_COMMIT }}-${{ hashFiles('Cargo.lock', 'firmware/memory.x') }}
+          key: thumbv6m-flower-${{ env.RUST_TOOLCHAIN }}-sdk-${{ env.CC2340_SDK_COMMIT }}-${{ hashFiles('Cargo.lock', 'firmware/memory.x', 'bootloader/memory.x') }}
+      - name: Install imgtool
+        run: |
+          python3 -m venv "$RUNNER_TEMP/imgtool"
+          "$RUNNER_TEMP/imgtool/bin/pip" install --quiet "imgtool==${IMGTOOL_VERSION}"
+          echo "$RUNNER_TEMP/imgtool/bin" >> "$GITHUB_PATH"
+      # The project's own private key is never available to CI. Every own-
+      # channel artifact (and the matching bootloader) is signed with a key
+      # generated for this run only, so CI output is test-signed and must
+      # not be installed on boards running a release bootloader.
+      - name: Generate ephemeral own-channel key
+        run: |
+          imgtool keygen -t ecdsa-p256 -k "$RUNNER_TEMP/ci-own.pem"
+          imgtool getpub -k "$RUNNER_TEMP/ci-own.pem" -e raw |
+            python3 -c 'import sys; print(sys.stdin.buffer.read()[-64:].hex())' \
+            > "$RUNNER_TEMP/ci-own.xy.hex"
+          echo "FLOWER_OWN_KEY=$RUNNER_TEMP/ci-own.pem" >> "$GITHUB_ENV"
+          echo "FLOWER_OWN_KEY_XY=$RUNNER_TEMP/ci-own.xy.hex" >> "$GITHUB_ENV"
+      - name: Check out MCUboot sample key (migrate channel)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: mcu-tools/mcuboot
+          ref: ${{ env.MCUBOOT_COMMIT }}
+          path: .ci/mcuboot
+          fetch-depth: 1
+          sparse-checkout: root-ec-p256.pem
+          sparse-checkout-cone-mode: false
+      - name: Check the migrate key matches keys/
+        run: |
+          imgtool getpub -k .ci/mcuboot/root-ec-p256.pem -e raw |
+            python3 -c 'import sys; print(sys.stdin.buffer.read()[-64:].hex())' > "$RUNNER_TEMP/ti.xy.hex"
+          diff <(tr -d ' \n' < keys/ti-root-ec-p256.xy.hex) <(tr -d '\n' < "$RUNNER_TEMP/ti.xy.hex")
+          echo "FLOWER_TI_KEY=$GITHUB_WORKSPACE/.ci/mcuboot/root-ec-p256.pem" >> "$GITHUB_ENV"
+      - name: Bootloader
+        working-directory: bootloader
+        run: |
+          cargo clippy --release --locked -- -D warnings
+          cargo build --release --locked
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          SIZE=$(find "$(rustc --print sysroot)" -name llvm-size -print -quit)
+          ELF=../target/thumbv6m-none-eabi/release/flower-boot
+          "$OBJCOPY" --gap-fill 0xff -O binary "$ELF" ../target/flower-boot.bin
+          "$SIZE" "$ELF"
+          TEXT=$("$SIZE" -A "$ELF" | awk '$1==".vector_table"||$1==".text"||$1==".rodata"||$1==".data"{s+=$2} END{print s}')
+          echo "bootloader: ${TEXT} B of $((0x3FE0)) B (+32 B LoaderInfo)" >> "$GITHUB_STEP_SUMMARY"
       - name: Build explicit no-SDK fallback
         working-directory: firmware
         run: |
@@ -104,12 +155,11 @@ jobs:
           CC2340_SDK_DIR: ${{ github.workspace }}/.ci/simplelink-lowpower-f3-sdk
         run: |
           cargo build --release --locked --target-dir target/sdk
-          cargo build --release --locked --no-default-features --features diyzi \
+          cargo build --release --locked --no-default-features --features diyzi,quiet \
             --target-dir target/sdk-diyzi
       - name: Check SDK marker, layout, AES and role gates
         run: |
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
-          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
           for VARIANT in sdk sdk-diyzi; do
             ELF=firmware/target/$VARIANT/thumbv6m-none-eabi/release/cc2340-flower
             if ! grep -aFq 'TI SimpleLink Low Power F3 SDK cc23x0r5/rf_patches' "$ELF"; then
@@ -117,10 +167,11 @@ jobs:
               exit 1
             fi
             LAYOUT="$("$NM" -n "$ELF")"
-            if ! grep -q '^0007d800 A _detection_partition_start$' <<<"$LAYOUT" ||
-               ! grep -q '^0007e000 A _security_partition_start$' <<<"$LAYOUT" ||
-               ! grep -q '^00080000 A _security_partition_end$' <<<"$LAYOUT"; then
-              echo "$VARIANT linker symbols do not preserve the detection/security partitions" >&2
+            if ! grep -q '^00004000 A _primary_slot_start$' <<<"$LAYOUT" ||
+               ! grep -q '^00041800 A _secondary_slot_start$' <<<"$LAYOUT" ||
+               ! grep -q '^0007f000 A _nv_start$' <<<"$LAYOUT" ||
+               ! grep -q '^00004100 R __vector_table$' <<<"$LAYOUT"; then
+              echo "$VARIANT is not linked for koptserg's MCUboot layout (vectors at 0x4100)" >&2
               exit 1
             fi
             SYMS="$("$NM" --demangle "$ELF")"
@@ -134,22 +185,24 @@ jobs:
               grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
               exit 1
             fi
-            "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
-            "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
-            BYTES=$(stat -c '%s' "${ELF}.bin")
-            if (( BYTES > 0x7D800 )); then
-              echo "$VARIANT image is ${BYTES} B; the detection record starts at 0x7D800" >&2
-              exit 1
-            fi
-            echo "$VARIANT: ${BYTES} B (limit $((0x7D800)) B)" >> "$GITHUB_STEP_SUMMARY"
           done
-      - name: Upload firmware
+      - name: Sign and package (migrate + test-signed own)
+        run: |
+          for VARIANT in koptserg diyzi; do
+            DIR=sdk; [ "$VARIANT" = diyzi ] && DIR=sdk-diyzi
+            python3 tools/flower_ota.py release --variant "$VARIANT" \
+              --app-elf "firmware/target/$DIR/thumbv6m-none-eabi/release/cc2340-flower" \
+              --objcopy "$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)" \
+              --loader-bin target/flower-boot.bin --out dist
+          done
+          cp target/flower-boot.bin dist/
+          python3 tools/flower_ota.py check dist/*.zigbee
+          for BIN in dist/*-unsigned.bin; do
+            echo "$(basename "$BIN"): $(stat -c '%s' "$BIN") B (limit $((0x3CC00)) B)" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cc2340-flower-firmware
-          path: |
-            firmware/target/sdk/thumbv6m-none-eabi/release/cc2340-flower.bin
-            firmware/target/sdk/thumbv6m-none-eabi/release/cc2340-flower.hex
-            firmware/target/sdk-diyzi/thumbv6m-none-eabi/release/cc2340-flower.bin
-            firmware/target/sdk-diyzi/thumbv6m-none-eabi/release/cc2340-flower.hex
+          name: flower-ci-test-signed
+          path: dist/
           if-no-files-found: error
