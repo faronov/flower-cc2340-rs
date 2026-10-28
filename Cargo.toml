@@ -8,7 +8,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/board", "crates/product"]
+members = ["crates/board", "crates/product", "firmware"]
 default-members = ["crates/board", "crates/product"]
 
 [workspace.package]
