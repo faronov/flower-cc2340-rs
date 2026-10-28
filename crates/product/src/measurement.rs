@@ -31,7 +31,28 @@ use zigbee_zcl::clusters::illuminance::measured_value_from_centi_lux;
 use crate::battery::{battery_measurement, battery_percent};
 use crate::calibration::SoilCalibration;
 use crate::detection::{DetectedSensors, LightSensor, TemperatureSource};
+use crate::ota::{FlowerOtaProfile, SupplyLatch};
 use crate::profile::FlowerProfile;
+use zigbee_runtime::firmware_writer::FirmwareWriter;
+use zigbee_runtime::profile::PlantSensor;
+
+/// Profiles carrying the flower's [`PlantSensor`] component, with or
+/// without the OTA client.
+pub trait PlantAccess {
+    fn plant_mut(&mut self) -> &mut PlantSensor;
+}
+
+impl PlantAccess for FlowerProfile {
+    fn plant_mut(&mut self) -> &mut PlantSensor {
+        self.component_mut()
+    }
+}
+
+impl<W: FirmwareWriter> PlantAccess for FlowerOtaProfile<W> {
+    fn plant_mut(&mut self) -> &mut PlantSensor {
+        self.inner_mut().component_mut()
+    }
+}
 
 /// Conversions averaged per soil sample (reference `soil_moisture(10, …)`).
 pub const SOIL_SAMPLES: u8 = 10;
@@ -112,6 +133,7 @@ pub struct FlowerMeasurement<I2C, S, M, D> {
     calibration: SoilCalibration,
     cadence: Cadence,
     periodic_ticks: u32,
+    supply_latch: Option<&'static SupplyLatch>,
 }
 
 impl<I2C, S, M, D> FlowerMeasurement<I2C, S, M, D> {
@@ -134,7 +156,15 @@ impl<I2C, S, M, D> FlowerMeasurement<I2C, S, M, D> {
             calibration,
             cadence,
             periodic_ticks: 0,
+            supply_latch: None,
         }
+    }
+
+    /// Publish every compensated supply reading to `latch` (the OTA
+    /// battery guard).
+    pub const fn with_supply_latch(mut self, latch: &'static SupplyLatch) -> Self {
+        self.supply_latch = Some(latch);
+        self
     }
 
     pub const fn sensors(&self) -> DetectedSensors {
@@ -161,8 +191,9 @@ impl<I2C, S, M, D> FlowerMeasurement<I2C, S, M, D> {
     }
 }
 
-impl<I2C, S, M, D> SensorMeasurement<FlowerProfile> for FlowerMeasurement<I2C, S, M, D>
+impl<P, I2C, S, M, D> SensorMeasurement<P> for FlowerMeasurement<I2C, S, M, D>
 where
+    P: PlantAccess,
     I2C: I2c,
     S: SoilProbe,
     M: SupplyMonitor,
@@ -170,12 +201,12 @@ where
 {
     async fn measure<G: Diagnostics>(
         &mut self,
-        profile: &mut FlowerProfile,
+        profile: &mut P,
         trigger: SampleTrigger,
         diagnostics: &mut G,
     ) {
         let due = self.schedule(trigger);
-        let plant = profile.component_mut();
+        let plant = profile.plant_mut();
 
         // 1. Start the I2C conversions.
         let temperature_source = self.sensors.temperature_source();
@@ -218,6 +249,9 @@ where
                 .monitor
                 .supply_mv()
                 .map(|mv| self.calibration.compensated_supply_mv(mv));
+            if let (Some(latch), Some(supply)) = (self.supply_latch, supply_mv) {
+                latch.record(supply);
+            }
             if due.soil {
                 // Without a supply reading the calibration lines are
                 // unknown, so the probe is not even excited.
