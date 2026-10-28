@@ -8,15 +8,23 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-default = ["koptserg"]
+default = ["koptserg", "quiet"]
 # Soil-probe calibration of koptserg's board build.
 koptserg = ["cc2340-flower-product/koptserg"]
 # Soil-probe calibration of the DIYZi board build.
 diyzi = ["cc2340-flower-product/diyzi"]
+# Compile every `log` call out of release builds (about 60 KB of format
+# strings and code); needed for the image to fit the MCUboot slot with
+# headroom. Debug builds keep their logs.
+quiet = ["log/release_max_level_off"]
+# RTT logging (warnings and errors in release builds: info-level strings
+# would not fit the slot). For release builds replace `quiet`:
+#   --no-default-features --features koptserg,logs
+logs = ["dep:rtt-target", "log/release_max_level_warn"]
 
 [dependencies]
 cc2340-flower-product.workspace = true
-flower-cc2340r5.workspace = true
+flower-cc2340r5 = { workspace = true, features = ["runtime"] }
 sensor-sed-app.workspace = true
 zigbee-types.workspace = true
 zigbee-mac = { workspace = true, features = ["cc2340"] }
@@ -30,11 +38,12 @@ embassy-futures = "0.1"
 
 # ARM Cortex-M0+ support
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
-cortex-m-rt = "0.7"
+# `set-vtor`/`set-sp`: koptserg's MCUboot does not load VTOR (src/startup.rs).
+cortex-m-rt = { version = "0.7.5", features = ["set-vtor", "set-sp"] }
 
 # Logging
 log = "0.4"
-rtt-target = "0.6"
+rtt-target = { version = "0.6", optional = true }
 
 # Panic handler for embedded target
 panic-halt = "1.0"

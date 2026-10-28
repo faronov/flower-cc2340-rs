@@ -367,8 +367,10 @@ impl Supervisor for ResetOnlySupervisor<'_> {
 
 // ── Diagnostics ─────────────────────────────────────────────────────
 
+#[cfg(feature = "logs")]
 struct RttLogger;
 
+#[cfg(feature = "logs")]
 impl log::Log for RttLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         metadata.level() <= log::Level::Info
@@ -388,6 +390,7 @@ impl log::Log for RttLogger {
     fn flush(&self) {}
 }
 
+#[cfg(feature = "logs")]
 static LOGGER: RttLogger = RttLogger;
 
 /// Lifecycle diagnostics rendered through RTT. Also latches a network
@@ -428,12 +431,20 @@ impl Diagnostics for RttDiagnostics<'_> {
     }
 }
 
-/// Initialize the RTT transport.
+/// Initialize the RTT transport (feature `logs`; otherwise logs go
+/// nowhere and release builds compile them out).
 pub fn init_diagnostics(left_network: &Cell<bool>) -> RttDiagnostics<'_> {
+    #[cfg(feature = "logs")]
+    init_rtt();
+    RttDiagnostics { left_network }
+}
+
+#[cfg(feature = "logs")]
+fn init_rtt() {
     let channels = rtt_target::rtt_init! {
         up: {
             0: {
-                size: 1024,
+                size: 512,
                 mode: rtt_target::ChannelMode::NoBlockSkip,
                 name: "Terminal"
             }
@@ -454,8 +465,6 @@ pub fn init_diagnostics(left_network: &Cell<bool>) -> RttDiagnostics<'_> {
             log::set_max_level_racy(log::LevelFilter::Info);
         }
     });
-
-    RttDiagnostics { left_network }
 }
 
 pub fn halt() -> ! {

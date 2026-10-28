@@ -13,6 +13,10 @@
 //! network the firmware reboots, so the next boot is factory-new and probes
 //! again.
 //!
+//! The image runs from `0x4100` behind a 0x100-byte MCUboot header, under
+//! either koptserg's MCUboot or `bootloader/`; [`product::ota::Channel`]
+//! tells them apart and selects the OTA identity.
+//!
 //! Not validated on hardware: see the README.
 
 #![no_std]
@@ -20,6 +24,12 @@
 #![feature(impl_trait_in_assoc_type)]
 
 mod platform;
+mod startup;
+
+#[cfg(all(feature = "logs", feature = "quiet", not(debug_assertions)))]
+compile_error!(
+    "`logs` has no effect in release builds with `quiet`: use --no-default-features --features <calibration>,logs"
+);
 
 use core::cell::{Cell, RefCell};
 use core::mem::MaybeUninit;
@@ -31,7 +41,9 @@ use cc2340_flower_product as product;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use flower_cc2340r5 as board;
-use sensor_sed_app::{DiagnosticEvent, Diagnostics, NoOta, SensorApp, SensorSedParts};
+use product::ota::{Channel, FlowerOtaLifecycle, OtaIdentity};
+use product::storage::{NvContents, SharedFlash};
+use sensor_sed_app::{DiagnosticEvent, Diagnostics, SensorApp, SensorSedParts};
 use zigbee_mac::cc2340::{Cc2340Mac, RadioError};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
@@ -54,7 +66,7 @@ async fn main(_spawner: Spawner) {
         button,
         mut i2c,
         soil,
-        mut flash,
+        flash,
         batmon,
         reset,
     } = resources;
@@ -75,8 +87,34 @@ async fn main(_spawner: Spawner) {
     };
     log::info!("[FLOWER] factory EUI-64: {:02X?}", ieee);
 
-    // The endpoint is fixed from here on.
-    let (sensors, origin) = product::boot::resolve_sensors(&mut flash, ieee, &mut i2c);
+    // One internal-flash token shared by the journal, the OTA writer and
+    // the loader-record read; each operation borrows it briefly.
+    let flash = RefCell::new(flash);
+    let channel = Channel::read(&mut SharedFlash::new(&flash));
+    let identity = OtaIdentity::new(channel, product::ota::VARIANT);
+    log::info!(
+        "[FLOWER] OTA channel {channel:?}: manufacturer 0x{:04X} image type 0x{:04X} version 0x{:08X}",
+        identity.manufacturer_code,
+        identity.image_type,
+        product::ota::FILE_VERSION
+    );
+
+    // Persistent data and the endpoint, which is fixed from here on.
+    // Destructured at once: a moved-from `Opened` would otherwise keep a
+    // second journal-sized slot in the main task's future.
+    let product::boot::Opened {
+        journal: mut security_store,
+        sensors,
+        origin,
+        nv,
+    } = product::boot::open(SharedFlash::new(&flash), ieee, &mut i2c);
+    match nv {
+        Ok(NvContents::ErasedForeign) => {
+            log::warn!("[FLOWER] erased foreign persistent data (migrated board): joining as new")
+        }
+        Ok(contents) => log::info!("[FLOWER] persistent data: {contents:?}"),
+        Err(error) => log::error!("[FLOWER] persistent data unusable: {error:?}"),
+    }
     log::info!("[FLOWER] sensors {sensors:?} ({origin:?})");
 
     let mut mac = match Cc2340Mac::new(ieee) {
@@ -102,7 +140,12 @@ async fn main(_spawner: Spawner) {
     // Build the device in static storage: by-value `build()` needs a frame
     // larger than this part's whole stack.
     static mut DEVICE_STORAGE: MaybeUninit<ZigbeeDevice<Cc2340Mac>> = MaybeUninit::uninit();
-    let mut profile = product::profile::flower_profile(sensors);
+    let Ok(mut profile) =
+        product::ota::flower_ota_profile(sensors, &identity, SharedFlash::new(&flash))
+    else {
+        log::error!("[FLOWER] OTA client endpoint mismatch");
+        fatal(&leds);
+    };
     let device = ZigbeeDevice::builder(mac)
         .power_mode(product::policy::SENSOR_POLICY.power_mode())
         .automatic_polling(false)
@@ -122,7 +165,6 @@ async fn main(_spawner: Spawner) {
         // reference ever taken to DEVICE_STORAGE.
         .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) });
 
-    let mut security_store = product::storage::security_store(flash);
     match device.reset_security_state_if_identity_changed(&mut security_store, ieee) {
         Ok(true) => log::warn!("[FLOWER] cleared persisted state for a different EUI-64"),
         Ok(false) => {}
@@ -140,7 +182,8 @@ async fn main(_spawner: Spawner) {
         sensors,
         product::calibration::ACTIVE,
         product::measurement::CADENCE,
-    );
+    )
+    .with_supply_latch(&product::ota::SUPPLY);
     let node = ZigbeeNode::new(device, &mut security_store, &mut profile);
     let mut app = SensorApp::new(
         node,
@@ -150,7 +193,7 @@ async fn main(_spawner: Spawner) {
             status: platform::StatusLeds::new(&leds),
             environment: measurement,
             battery: product::battery::SampledWithSensors,
-            ota: NoOta,
+            ota: FlowerOtaLifecycle::new(channel, &product::ota::SUPPLY, reset_into_bootloader),
             actions: product::policy::USER_ACTIONS,
             supervisor: platform::ResetOnlySupervisor::new(&reset),
             diagnostics,
@@ -173,6 +216,12 @@ async fn main(_spawner: Spawner) {
             reset.reset();
         }
     }
+}
+
+/// After the upgrade request is written: the bootloader installs the
+/// staged image on this reset.
+fn reset_into_bootloader() -> ! {
+    cortex_m::peripheral::SCB::sys_reset()
 }
 
 fn fatal(leds: &RefCell<platform::Indicators>) -> ! {
