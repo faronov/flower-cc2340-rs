@@ -7,13 +7,13 @@
 //! the device is commissioned: a sensor that fails to answer one boot must
 //! not make a cluster disappear from an interviewed device.
 //!
-//! [`resolve_at_boot`] therefore probes the bus only while the device is
-//! factory-new (never joined, or after leave/factory reset) and persists the
-//! result in a dedicated 2-KiB flash sector. A commissioned boot reuses the
-//! persisted set without touching the bus.
+//! [`resolve`] therefore probes the bus only while the device is
+//! factory-new (never joined, or after leave/factory reset). The result is
+//! persisted as the security journal's product tag ([`encode_tag`]), which
+//! is committed atomically with the security state it was advertised in. A
+//! commissioned boot reuses the persisted set without touching the bus.
 
 use embedded_hal::i2c::I2c;
-use embedded_storage::nor_flash::NorFlash;
 
 /// The set of fitted optional sensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -117,143 +117,58 @@ pub fn detect<I2C: I2c>(bus: &mut I2C) -> DetectedSensors {
     }
 }
 
-// ── Persistent record ───────────────────────────────────────────────
+// ── Persistence as the security-journal product tag ─────────────────
 
-const RECORD_MAGIC: u32 = 0x464C_5752; // "FLWR"
-const RECORD_VERSION: u8 = 1;
-/// Multiple of every CC2340 flash write granule.
-pub const RECORD_LEN: usize = 16;
+const TAG_MARKER: u16 = 0xA500;
 
-/// `magic(4) version(1) bits(1) !bits(1) 0xFF(1) crc32(4) 0xFF(4)`;
-/// the CRC covers bytes 0..8.
-pub fn encode_record(sensors: DetectedSensors) -> [u8; RECORD_LEN] {
-    let mut record = [0xFF; RECORD_LEN];
-    record[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
-    record[4] = RECORD_VERSION;
-    record[5] = sensors.bits();
-    record[6] = !sensors.bits();
-    record[7] = 0xFF;
-    let crc = crc32(&record[0..8]);
-    record[8..12].copy_from_slice(&crc.to_le_bytes());
-    record
+/// Encode a sensor set as the security journal's product tag
+/// (`0xA5`, complement nibble, set bits). The tag is committed atomically
+/// with the next security-state record, so the persisted set always belongs
+/// to the network state it was advertised in.
+pub const fn encode_tag(sensors: DetectedSensors) -> u16 {
+    let bits = sensors.bits() as u16;
+    TAG_MARKER | ((!bits & 0x7) << 4) | bits
 }
 
-pub fn decode_record(record: &[u8; RECORD_LEN]) -> Option<DetectedSensors> {
-    let magic = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
-    let crc = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-    if magic != RECORD_MAGIC
-        || record[4] != RECORD_VERSION
-        || record[5] != !record[6]
-        || crc != crc32(&record[0..8])
-    {
+/// Decode a product tag. The untagged value `0xFFFF`, tags of other
+/// products, and unknown sensor bits are rejected.
+pub const fn decode_tag(tag: u16) -> Option<DetectedSensors> {
+    if tag & 0xFF00 != TAG_MARKER || tag & 0x0080 != 0 {
         return None;
     }
-    DetectedSensors::from_bits(record[5])
-}
-
-/// IEEE 802.3 CRC-32 (reflected, poly 0xEDB88320), bitwise: the record is
-/// tiny and read once per boot.
-const fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    let mut index = 0;
-    while index < bytes.len() {
-        crc ^= bytes[index] as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            bit += 1;
-        }
-        index += 1;
+    let bits = (tag & 0x0F) as u8;
+    let check = ((tag >> 4) & 0x7) as u8;
+    if bits & 0x08 != 0 || check != !bits & 0x7 {
+        return None;
     }
-    !crc
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetectionStoreError<E> {
-    Flash(E),
-    /// The written record did not read back intact.
-    Verify,
-}
-
-/// The detected-sensor record in its own erase sector (normally a
-/// [`crate::storage::DetectionPartition`]).
-pub struct DetectionStore<F> {
-    flash: F,
-}
-
-impl<F: NorFlash> DetectionStore<F> {
-    pub const fn new(flash: F) -> Self {
-        Self { flash }
-    }
-
-    pub fn into_inner(self) -> F {
-        self.flash
-    }
-
-    /// The persisted set, or `None` if the sector is erased, torn or from
-    /// another format. Read errors are treated the same: the caller then
-    /// re-detects.
-    pub fn load(&mut self) -> Option<DetectedSensors> {
-        let mut record = [0u8; RECORD_LEN];
-        self.flash.read(0, &mut record).ok()?;
-        decode_record(&record)
-    }
-
-    /// Replace the record. An interrupted erase or write leaves an erased or
-    /// CRC-invalid sector, which [`Self::load`] rejects; the next boot is
-    /// then necessarily factory-new and simply detects again.
-    pub fn save(&mut self, sensors: DetectedSensors) -> Result<(), DetectionStoreError<F::Error>> {
-        let erase_end = F::ERASE_SIZE.max(RECORD_LEN) as u32;
-        self.flash
-            .erase(0, erase_end)
-            .map_err(DetectionStoreError::Flash)?;
-        self.flash
-            .write(0, &encode_record(sensors))
-            .map_err(DetectionStoreError::Flash)?;
-        if self.load() == Some(sensors) {
-            Ok(())
-        } else {
-            Err(DetectionStoreError::Verify)
-        }
-    }
+    DetectedSensors::from_bits(bits)
 }
 
 /// How the boot-time sensor set was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectionOrigin {
-    /// Commissioned boot: the persisted set was reused without probing.
+    /// Commissioned boot: the set persisted with the network state was
+    /// reused without probing.
     Persisted,
-    /// Factory-new boot: probed; the record already matched.
-    DetectedUnchanged,
-    /// Factory-new boot: probed and the new set was persisted.
-    DetectedSaved,
-    /// Probed, but persisting failed. The set is still used for this boot.
-    DetectedNotSaved,
+    /// Factory-new boot: probed. The set is committed with the next
+    /// security-state record.
+    Detected,
 }
 
 /// Resolve the sensor set that defines this boot's endpoint.
 ///
-/// - Commissioned with a valid record: reuse it, do not probe.
-/// - Otherwise (factory-new, or a commissioned device whose record is
-///   missing/corrupt): probe with `probe` and persist the result if it
-///   differs from the stored one, to avoid needless erase cycles.
-pub fn resolve_at_boot<F: NorFlash>(
-    store: &mut DetectionStore<F>,
+/// A commissioned boot whose newest journal record carries a valid tag
+/// reuses that set and does not touch the bus: a sensor that fails to
+/// answer once must not remove a cluster from an interviewed device.
+/// Otherwise (factory-new, after leave, or no valid tag) `probe` runs.
+pub fn resolve(
+    tag: Option<u16>,
     commissioned: bool,
     probe: impl FnOnce() -> DetectedSensors,
 ) -> (DetectedSensors, DetectionOrigin) {
-    let stored = store.load();
-    if commissioned && let Some(sensors) = stored {
-        return (sensors, DetectionOrigin::Persisted);
-    }
-    let detected = probe();
-    if stored == Some(detected) {
-        return (detected, DetectionOrigin::DetectedUnchanged);
-    }
-    match store.save(detected) {
-        Ok(()) => (detected, DetectionOrigin::DetectedSaved),
-        Err(_) => (detected, DetectionOrigin::DetectedNotSaved),
+    match tag.and_then(decode_tag) {
+        Some(sensors) if commissioned => (sensors, DetectionOrigin::Persisted),
+        _ => (probe(), DetectionOrigin::Detected),
     }
 }
 
@@ -369,10 +284,10 @@ pub(crate) mod fake_bus {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::fake_bus::FakeBus;
     use super::*;
-    use crate::storage::mock::MockMainFlash;
-    use crate::storage::{DETECTION_PARTITION_START, DetectionPartition};
 
     const COMBINATIONS: [DetectedSensors; 8] = {
         let mut all = [DetectedSensors::NONE; 8];
@@ -386,10 +301,6 @@ mod tests {
         }
         all
     };
-
-    fn store(flash: &mut MockMainFlash) -> DetectionStore<DetectionPartition<&mut MockMainFlash>> {
-        DetectionStore::new(DetectionPartition::new(flash))
-    }
 
     #[test]
     fn bits_round_trip_and_reject_unknown_bits() {
@@ -467,132 +378,87 @@ mod tests {
     }
 
     #[test]
-    fn record_round_trips_every_combination_through_flash() {
+    fn tag_round_trips_every_combination() {
+        let mut tags = std::vec::Vec::new();
         for sensors in COMBINATIONS {
-            let mut flash = MockMainFlash::new();
-            store(&mut flash).save(sensors).unwrap();
-            assert_eq!(store(&mut flash).load(), Some(sensors));
-            // Only the detection sector was touched.
-            let start = DETECTION_PARTITION_START as usize;
-            assert!(flash.bytes[..start].iter().all(|b| *b == 0xFF));
-            assert!(flash.bytes[start + RECORD_LEN..].iter().all(|b| *b == 0xFF));
+            let tag = encode_tag(sensors);
+            assert_eq!(tag >> 8, 0xA5);
+            assert_eq!(decode_tag(tag), Some(sensors));
+            tags.push(tag);
+        }
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), 8);
+        assert_eq!(encode_tag(DetectedSensors::NONE), 0xA570);
+    }
+
+    #[test]
+    fn foreign_and_corrupt_tags_are_rejected() {
+        let good = encode_tag(DetectedSensors {
+            tmp102: true,
+            ..DetectedSensors::NONE
+        });
+        assert!(decode_tag(good).is_some());
+        // Untagged records, other products, flipped bits.
+        for tag in [
+            0xFFFF,
+            0x0000,
+            0xA5FF,
+            0x5A61,
+            good ^ 0x0001,
+            good ^ 0x0010,
+            good | 0x0080,
+        ] {
+            assert_eq!(decode_tag(tag), None, "{tag:#06x}");
+        }
+        // A consistent complement over unknown bit 3 is still rejected.
+        assert_eq!(decode_tag(0xA508 | (0x7 << 4)), None);
+        // Every one-bit corruption of every valid tag is detected.
+        for sensors in COMBINATIONS {
+            let tag = encode_tag(sensors);
+            for bit in 0..16 {
+                assert_eq!(decode_tag(tag ^ (1 << bit)), None, "{tag:#06x} bit {bit}");
+            }
         }
     }
 
     #[test]
-    fn erased_flash_has_no_record() {
-        let mut flash = MockMainFlash::new();
-        assert_eq!(store(&mut flash).load(), None);
-    }
-
-    #[test]
-    fn corrupt_records_are_rejected() {
-        let good = encode_record(DetectedSensors {
-            tmp102: true,
-            ..DetectedSensors::NONE
-        });
-        assert!(decode_record(&good).is_some());
-        for (index, flip) in [(0, 0x01), (4, 0x02), (5, 0x02), (6, 0x01), (9, 0x80)] {
-            let mut bad = good;
-            bad[index] ^= flip;
-            assert_eq!(decode_record(&bad), None, "byte {index}");
+    fn commissioned_boot_reuses_the_tag_without_probing() {
+        for persisted in COMBINATIONS {
+            let resolved = resolve(Some(encode_tag(persisted)), true, || {
+                panic!("a commissioned boot must not probe the bus")
+            });
+            assert_eq!(resolved, (persisted, DetectionOrigin::Persisted));
         }
-        // Torn write: second half still erased.
-        let mut torn = good;
-        torn[8..].fill(0xFF);
-        assert_eq!(decode_record(&torn), None);
-        // A valid CRC over unknown sensor bits is rejected too.
-        let mut unknown = [0xFF; RECORD_LEN];
-        unknown[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
-        unknown[4] = RECORD_VERSION;
-        unknown[5] = 0x08;
-        unknown[6] = !0x08;
-        let crc = crc32(&unknown[0..8]);
-        unknown[8..12].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(decode_record(&unknown), None);
     }
 
     #[test]
-    fn crc32_matches_the_standard_check_value() {
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-    }
-
-    #[test]
-    fn commissioned_boot_reuses_the_record_without_probing() {
-        let persisted = DetectedSensors {
+    fn factory_new_or_untagged_boots_probe() {
+        let probed = DetectedSensors {
             bh1750: true,
             ..DetectedSensors::NONE
         };
-        let mut flash = MockMainFlash::new();
-        store(&mut flash).save(persisted).unwrap();
-        let erases = flash.erased_physical_sectors;
-        let (sensors, origin) = resolve_at_boot(&mut store(&mut flash), true, || {
-            panic!("a commissioned boot must not probe the bus")
+        let stale = encode_tag(DetectedSensors {
+            tmp102: true,
+            ..DetectedSensors::NONE
         });
-        assert_eq!((sensors, origin), (persisted, DetectionOrigin::Persisted));
-        assert_eq!(flash.erased_physical_sectors, erases);
-    }
-
-    #[test]
-    fn factory_new_boot_redetects_and_persists_only_changes() {
-        let mut flash = MockMainFlash::new();
-        let first = DetectedSensors {
-            tmp102: true,
-            opt3001: true,
-            ..DetectedSensors::NONE
-        };
+        // Factory-new (after leave the tag is still there, but stale).
         assert_eq!(
-            resolve_at_boot(&mut store(&mut flash), false, || first),
-            (first, DetectionOrigin::DetectedSaved)
+            resolve(Some(stale), false, || probed),
+            (probed, DetectionOrigin::Detected)
         );
-        let erases = flash.erased_physical_sectors;
         assert_eq!(
-            resolve_at_boot(&mut store(&mut flash), false, || first),
-            (first, DetectionOrigin::DetectedUnchanged)
+            resolve(None, false, || probed),
+            (probed, DetectionOrigin::Detected)
         );
-        assert_eq!(flash.erased_physical_sectors, erases);
-
-        // Sensor removed while factory-new (after leave): new set wins.
-        let second = DetectedSensors {
-            tmp102: true,
-            ..DetectedSensors::NONE
-        };
+        // Commissioned without a valid tag.
         assert_eq!(
-            resolve_at_boot(&mut store(&mut flash), false, || second),
-            (second, DetectionOrigin::DetectedSaved)
+            resolve(Some(0xFFFF), true, || probed),
+            (probed, DetectionOrigin::Detected)
         );
-        // A following commissioned boot sees the latest set.
         assert_eq!(
-            resolve_at_boot(&mut store(&mut flash), true, || unreachable!()),
-            (second, DetectionOrigin::Persisted)
+            resolve(None, true, || probed),
+            (probed, DetectionOrigin::Detected)
         );
-    }
-
-    #[test]
-    fn commissioned_boot_without_a_valid_record_detects_and_saves() {
-        let mut flash = MockMainFlash::new();
-        let detected = DetectedSensors {
-            bh1750: true,
-            ..DetectedSensors::NONE
-        };
-        assert_eq!(
-            resolve_at_boot(&mut store(&mut flash), true, || detected),
-            (detected, DetectionOrigin::DetectedSaved)
-        );
-    }
-
-    #[test]
-    fn interrupted_save_reads_as_absent() {
-        let mut flash = MockMainFlash::new();
-        store(&mut flash)
-            .save(DetectedSensors {
-                tmp102: true,
-                ..DetectedSensors::NONE
-            })
-            .unwrap();
-        // Power lost after the erase of the next save.
-        let start = DETECTION_PARTITION_START as usize;
-        flash.bytes[start..start + 2048].fill(0xFF);
-        assert_eq!(store(&mut flash).load(), None);
     }
 }

@@ -18,16 +18,20 @@ diyzi = []
 embedded-hal.workspace = true
 embedded-hal-async.workspace = true
 embedded-storage.workspace = true
-sensor-sed-app.workspace = true
+flower-layout.workspace = true
+log = { version = "0.4", default-features = false }
+mcuboot-image = { workspace = true, features = ["firmware-writer"] }
+sensor-sed-app = { workspace = true, features = ["ota"] }
 zigbee-aps.workspace = true
 zigbee-bh1750.workspace = true
 zigbee-opt3001.workspace = true
-zigbee-runtime.workspace = true
+zigbee-mac.workspace = true
+zigbee-runtime = { workspace = true, features = ["ota"] }
 zigbee-tmp102.workspace = true
 zigbee-zcl.workspace = true
 
 [target.'cfg(target_os = "none")'.dependencies]
-flower-cc2340r5.workspace = true
+flower-cc2340r5 = { workspace = true, features = ["runtime"] }
 
 [dev-dependencies]
 zigbee-mac = { workspace = true, features = ["mock"] }

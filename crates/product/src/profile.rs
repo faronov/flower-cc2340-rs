@@ -309,7 +309,7 @@ mod tests {
         for bits in 0..8u8 {
             let sensors = DetectedSensors::from_bits(bits).unwrap();
             let decoded =
-                crate::detection::decode_record(&crate::detection::encode_record(sensors)).unwrap();
+                crate::detection::decode_tag(crate::detection::encode_tag(sensors)).unwrap();
             let a = flower_profile(sensors);
             let b = flower_profile(decoded);
             let mut ra = ExpectedReportClusters::new();
