@@ -1,2 +1,10 @@
 /target
 **/target
+# Release artifacts of tools/flower_ota.py
+/dist
+__pycache__/
+# Private signing keys never belong in the repository. The only committed
+# private key is the throwaway test-vector key.
+*.pem
+!keys/*.pub.pem
+!crates/product/tests/vectors/TEST-ONLY-ec-p256.pem
