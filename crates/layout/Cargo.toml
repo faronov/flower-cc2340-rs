@@ -1,0 +1,12 @@
+[package]
+name = "flower-layout"
+description = "Flash map and signing keys shared by the flower firmware and its bootloader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+mcuboot-image.workspace = true

@@ -10,10 +10,12 @@
 
 #![no_std]
 
+#[cfg(all(target_os = "none", feature = "runtime"))]
+pub use cc2340r5_hal::interrupts;
+#[cfg(target_os = "none")]
+pub use cc2340r5_hal::reset;
 pub use cc2340r5_hal::{MCU_CLOCK_HZ, TARGET_PART};
 pub use cc2340r5_hal::{adc, batmon, flash, i2c, identity, lgpt, power, standby, timebase};
-#[cfg(target_os = "none")]
-pub use cc2340r5_hal::{interrupts, reset};
 
 pub mod pins;
 pub mod soil;
@@ -30,7 +32,7 @@ pub const VDDR_REGULATOR: cc2340r5_hal::VddrRegulator = cc2340r5_hal::VddrRegula
 pub const I2C_SPEED: i2c::Speed = i2c::Speed::Standard100k;
 
 /// All exclusively owned board resources.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 pub struct Resources {
     /// Active-high green LED on DIO3.
     pub green_led: pins::GreenLed,
@@ -56,7 +58,7 @@ pub struct Resources {
 /// starts the time driver. LEDs start off. The button's press interrupt is
 /// configured but masked until the application enables it. I2C, ADC and
 /// LGPT1 stay clock gated until a measurement uses them.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "runtime"))]
 pub fn take() -> Option<Resources> {
     use cc2340r5_hal::adc::{Adc, AdcInput};
     use cc2340r5_hal::i2c::{I2c, I2cPins};
@@ -107,6 +109,37 @@ pub fn take() -> Option<Resources> {
         soil: SoilProbe::new(pwm, adc),
         flash,
         batmon,
+        reset,
+    })
+}
+
+/// The resources a bootloader uses: status LEDs, SW1 (SHUTDOWN wake-up)
+/// and the internal flash.
+#[cfg(target_os = "none")]
+pub struct BootResources {
+    pub green_led: pins::GreenLed,
+    pub red_led: pins::RedLed,
+    pub button: pins::UserButton,
+    pub flash: flash::InternalFlash,
+    pub reset: reset::SystemReset,
+}
+
+/// Claim the board for a bootloader exactly once.
+///
+/// Uses [`cc2340r5_hal::take_boot`], which leaves clocks, power and
+/// interrupts in the ROM boot state for the application. LEDs start off.
+#[cfg(target_os = "none")]
+pub fn take_boot() -> Option<BootResources> {
+    let cc2340r5_hal::BootCore {
+        mut pins,
+        flash,
+        reset,
+    } = cc2340r5_hal::take_boot()?;
+    Some(BootResources {
+        green_led: pins.led(false).ok()?,
+        red_led: pins.led(false).ok()?,
+        button: pins.button().ok()?,
+        flash,
         reset,
     })
 }

@@ -2,17 +2,28 @@
 # the pure-Rust zigbee-rs stack.
 #
 # Host crates (board, product) are the default members, so `cargo test` at
-# the root runs on the host. The firmware is a thumbv6m-none-eabi binary:
-# build it from `firmware/`, whose .cargo/config.toml selects the target and
-# build-std.
+# the root runs on the host. The firmware and the bootloader are
+# thumbv6m-none-eabi binaries: build them from `firmware/` and
+# `bootloader/`, whose .cargo/config.toml select the target and build-std.
 
 [workspace]
 resolver = "3"
-members = ["crates/board", "crates/product", "firmware"]
-default-members = ["crates/board", "crates/product"]
+members = [
+    "crates/board",
+    "crates/layout",
+    "crates/product",
+    "firmware",
+    "bootloader",
+]
+default-members = ["crates/board", "crates/layout", "crates/product"]
 
+# The package version is the firmware version: the MCUboot image version
+# (`imgtool sign --version`) and, encoded by `crates/product/src/ota.rs`, the
+# Zigbee OTA file version. It starts at 2.0.0 so that koptserg's MCUboot
+# (downgrade prevention against his 1.0.0 images) accepts the migration
+# image.
 [workspace.package]
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/faronov/flower-cc2340-rs"
@@ -21,7 +32,9 @@ publish = false
 # zigbee-rs crates. Cargo.lock pins the exact commit; `cargo update -p
 # zigbee-runtime` (or any one of them) moves all of them together.
 [workspace.dependencies]
-cc2340r5-hal = { git = "https://github.com/faronov/zigbee-rs", branch = "master" }
+cc2340r5-boot = { git = "https://github.com/faronov/zigbee-rs", branch = "master" }
+cc2340r5-hal = { git = "https://github.com/faronov/zigbee-rs", branch = "master", default-features = false }
+mcuboot-image = { git = "https://github.com/faronov/zigbee-rs", branch = "master" }
 sensor-sed-app = { git = "https://github.com/faronov/zigbee-rs", branch = "master" }
 zigbee-aps = { git = "https://github.com/faronov/zigbee-rs", branch = "master" }
 zigbee-bh1750 = { git = "https://github.com/faronov/zigbee-rs", branch = "master" }
@@ -33,7 +46,8 @@ zigbee-types = { git = "https://github.com/faronov/zigbee-rs", branch = "master"
 zigbee-zcl = { git = "https://github.com/faronov/zigbee-rs", branch = "master", default-features = false }
 
 # Local crates.
-flower-cc2340r5 = { path = "crates/board" }
+flower-cc2340r5 = { path = "crates/board", default-features = false }
+flower-layout = { path = "crates/layout" }
 cc2340-flower-product = { path = "crates/product", default-features = false }
 
 embedded-hal = "1.0"
@@ -41,6 +55,9 @@ embedded-hal-async = "1.0"
 embedded-storage = "0.3"
 heapless = "0.9"
 
+# Size first: the application must fit an MCUboot slot (see
+# `crates/product/link/memory.x`) and the bootloader 16 KiB.
 [profile.release]
-opt-level = "s"
+opt-level = "z"
+codegen-units = 1
 lto = true

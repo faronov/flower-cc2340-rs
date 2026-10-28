@@ -1,0 +1,23 @@
+[package]
+name = "flower-boot"
+description = "Overwrite-only MCUboot-compatible bootloader for the flower board (16 KiB at 0x0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+flower-layout.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+cc2340r5-boot.workspace = true
+flower-cc2340r5.workspace = true
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "1.0"
+
+[[bin]]
+name = "flower-boot"
+test = false
+bench = false

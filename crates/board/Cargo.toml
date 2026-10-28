@@ -7,5 +7,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = ["runtime"]
+# Application runtime: `take()` initializes power, clocks, standby and the
+# Embassy time driver. Bootloaders disable it and use `take_boot()`.
+runtime = ["cc2340r5-hal/runtime"]
+
 [dependencies]
-cc2340r5-hal.workspace = true
+cc2340r5-hal = { workspace = true, default-features = false }
