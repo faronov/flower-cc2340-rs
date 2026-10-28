@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Keep in sync with rust-toolchain.toml and zigbee-rs CI.
+  RUST_TOOLCHAIN: nightly-2026-03-23
+  # TI SimpleLink Low Power F3 SDK commit pinned by zigbee-rs CI. Only the
+  # cc23x0r5 radio microcode/settings are read (as data) by zigbee-mac's
+  # build script; no TI C code is compiled or linked.
+  CC2340_SDK_COMMIT: 68ca021502383f367d0bf2a5517fdd0dcb0ef909
+
+jobs:
+  host:
+    name: Host tests (${{ matrix.calibration }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        calibration: [koptserg, diyzi]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv6m-none-eabi
+          components: rust-src, llvm-tools, clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: host-${{ matrix.calibration }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - name: Format
+        if: matrix.calibration == 'koptserg'
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: |
+          cargo clippy --locked --all-targets \
+            -p flower-cc2340r5 -p cc2340-flower-product \
+            --no-default-features --features cc2340-flower-product/${{ matrix.calibration }} \
+            -- -D warnings
+      - name: Test
+        run: |
+          cargo test --locked \
+            -p flower-cc2340r5 -p cc2340-flower-product \
+            --no-default-features --features cc2340-flower-product/${{ matrix.calibration }}
+
+  firmware:
+    name: Firmware
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv6m-none-eabi
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
+          key: thumbv6m-flower-${{ env.RUST_TOOLCHAIN }}-sdk-${{ env.CC2340_SDK_COMMIT }}-${{ hashFiles('Cargo.lock', 'firmware/memory.x') }}
+      - name: Build explicit no-SDK fallback
+        working-directory: firmware
+        run: |
+          env -u CC2340_SDK_DIR cargo build --release --locked --target-dir target/fallback
+          ELF=target/fallback/thumbv6m-none-eabi/release/cc2340-flower
+          if ! grep -aFq 'radio firmware unavailable' "$ELF"; then
+            echo "fallback image is missing its unavailable-radio marker" >&2
+            exit 1
+          fi
+          if grep -aFq 'TI SimpleLink Low Power F3 SDK cc23x0r5/rf_patches' "$ELF"; then
+            echo "fallback image unexpectedly contains the SDK radio marker" >&2
+            exit 1
+          fi
+      - name: Check out pinned TI radio sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: TexasInstruments/simplelink-lowpower-f3-sdk
+          ref: ${{ env.CC2340_SDK_COMMIT }}
+          path: .ci/simplelink-lowpower-f3-sdk
+          fetch-depth: 1
+          sparse-checkout: |
+            source/ti/devices/cc23x0r5
+            source/ti/devices/radioconfig
+      - name: Clippy (firmware)
+        working-directory: firmware
+        env:
+          CC2340_SDK_DIR: ${{ github.workspace }}/.ci/simplelink-lowpower-f3-sdk
+        run: cargo clippy --release --locked --target-dir target/sdk -- -D warnings
+      - name: Build pinned-SDK firmware (koptserg and diyzi)
+        working-directory: firmware
+        env:
+          CC2340_SDK_DIR: ${{ github.workspace }}/.ci/simplelink-lowpower-f3-sdk
+        run: |
+          cargo build --release --locked --target-dir target/sdk
+          cargo build --release --locked --no-default-features --features diyzi \
+            --target-dir target/sdk-diyzi
+      - name: Check SDK marker, layout, AES and role gates
+        run: |
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          for VARIANT in sdk sdk-diyzi; do
+            ELF=firmware/target/$VARIANT/thumbv6m-none-eabi/release/cc2340-flower
+            if ! grep -aFq 'TI SimpleLink Low Power F3 SDK cc23x0r5/rf_patches' "$ELF"; then
+              echo "$VARIANT image is missing the pinned radio-firmware marker" >&2
+              exit 1
+            fi
+            LAYOUT="$("$NM" -n "$ELF")"
+            if ! grep -q '^0007d800 A _detection_partition_start$' <<<"$LAYOUT" ||
+               ! grep -q '^0007e000 A _security_partition_start$' <<<"$LAYOUT" ||
+               ! grep -q '^00080000 A _security_partition_end$' <<<"$LAYOUT"; then
+              echo "$VARIANT linker symbols do not preserve the detection/security partitions" >&2
+              exit 1
+            fi
+            SYMS="$("$NM" --demangle "$ELF")"
+            if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
+              echo "$VARIANT image is missing its software AES backend" >&2
+              exit 1
+            fi
+            PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+            if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
+              echo "$VARIANT links parent/router maintenance symbols:" >&2
+              grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
+              exit 1
+            fi
+            "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+            "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+            BYTES=$(stat -c '%s' "${ELF}.bin")
+            if (( BYTES > 0x7D800 )); then
+              echo "$VARIANT image is ${BYTES} B; the detection record starts at 0x7D800" >&2
+              exit 1
+            fi
+            echo "$VARIANT: ${BYTES} B (limit $((0x7D800)) B)" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cc2340-flower-firmware
+          path: |
+            firmware/target/sdk/thumbv6m-none-eabi/release/cc2340-flower.bin
+            firmware/target/sdk/thumbv6m-none-eabi/release/cc2340-flower.hex
+            firmware/target/sdk-diyzi/thumbv6m-none-eabi/release/cc2340-flower.bin
+            firmware/target/sdk-diyzi/thumbv6m-none-eabi/release/cc2340-flower.hex
+          if-no-files-found: error
