@@ -1,0 +1,11 @@
+[package]
+name = "flower-cc2340r5"
+description = "Pure-Rust board support for koptserg's CC2340R5 RGE soil-moisture (flower) board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cc2340r5-hal.workspace = true

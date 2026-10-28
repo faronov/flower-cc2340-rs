@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned nightly: Embassy's `nightly` executor feature sizes task storage at
+# compile time, and the firmware builds `core`/`alloc` with build-std.
+channel = "nightly-2026-03-23"
+targets = ["thumbv6m-none-eabi"]
+components = ["rust-src", "llvm-tools", "clippy", "rustfmt"]
+profile = "minimal"
