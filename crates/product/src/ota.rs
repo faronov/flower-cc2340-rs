@@ -78,7 +78,9 @@ pub const KOPTSERG_LATEST_RELEASES: [u32; 2] = [0x2400_0013, 0x2410_0013];
 
 /// No download below this (compensated) supply: a CR2032 near its end
 /// could brown out during the minutes of radio activity, and the
-/// bootloader's copy erases and programs the whole primary slot.
+/// bootloader's copy erases and programs the whole primary slot. Checked
+/// when an image is offered, again while the session runs and right before
+/// activation.
 pub const OTA_MIN_SUPPLY_MV: u16 = 2_500;
 /// First client query after joining, then one per day.
 pub const FIRST_QUERY_DELAY_SECS: u32 = 300;
@@ -362,6 +364,28 @@ impl FlowerOtaLifecycle {
         self.channel
     }
 
+    /// Re-apply the offer's supply check to a session in progress: the
+    /// battery can sag during the long download, and the bootloader's copy
+    /// that follows activation rewrites the whole primary slot. A session
+    /// abandoned here discards its staged image; the server offers it again
+    /// later.
+    fn abandon_on_low_supply<W: FirmwareWriter>(&mut self, manager: &mut OtaManager<W>) -> bool {
+        if !OtaSession::is_active(manager) && !self.session.activation_pending() {
+            return false;
+        }
+        if offer_decision(self.channel, self.supply.get()).is_ok() {
+            return false;
+        }
+        log::warn!("[ota] supply below {OTA_MIN_SUPPLY_MV} mV: abandoning the upgrade");
+        manager.abort();
+        if self.session.activation_pending() {
+            // Clear the session's flag without a checkpoint: the aborted
+            // manager refuses the activation and writes nothing.
+            let _ = self.session.activate(manager);
+        }
+        true
+    }
+
     fn log_status(status: Option<&StackEvent>) {
         match status {
             Some(StackEvent::OtaImageAvailable { version, size }) => {
@@ -442,6 +466,7 @@ where
     ) -> OtaServiceOutcome {
         let (device, profile) = node.device_and_profile_mut();
         let manager = profile.ota_mut();
+        self.abandon_on_low_supply(manager);
         let mut queried = false;
         if self.schedule.advance(elapsed_secs) && self.channel.accepts_images() {
             self.session
@@ -464,8 +489,13 @@ where
     ) -> AppOtaActivationOutcome {
         // SensorApp has just checkpointed the security state. The writer
         // writes the upgrade request magic; the bootloader installs on the
-        // next reset.
-        match self.session.activate(node.profile_mut().ota_mut()) {
+        // next reset. With too little supply the image is discarded first,
+        // so the activation fails without writing the request.
+        let manager = node.profile_mut().ota_mut();
+        if self.abandon_on_low_supply(manager) {
+            return AppOtaActivationOutcome::Failed;
+        }
+        match self.session.activate(manager) {
             Ok(()) => {
                 log::info!("[ota] activated, resetting into the bootloader");
                 (self.reset)()
@@ -488,7 +518,8 @@ mod tests {
     use crate::storage::mock::MockMainFlash;
     use flower_layout::{NV_START, PRIMARY_SLOT, SECONDARY_SLOT, SLOT_SIZE};
     use mcuboot_image::{BOOT_MAGIC, MagicState, trailer::read_magic};
-    use zigbee_runtime::firmware_writer::FirmwareError;
+    use zigbee_runtime::firmware_writer::{FirmwareError, MockFirmwareWriter};
+    use zigbee_zcl::clusters::ota::{CMD_QUERY_NEXT_IMAGE_RESPONSE, OtaState};
 
     const TEST_KEY_XY: &[u8; 64] = include_bytes!("../tests/vectors/test-key.xy");
     const TEST_V1: &[u8] = include_bytes!("../tests/vectors/test-v1.bin");
@@ -771,6 +802,45 @@ mod tests {
             assert!(plain_clients.is_empty());
             assert_eq!(clients, [ClusterId::OTA_UPGRADE]);
         }
+    }
+
+    fn downloading_manager() -> OtaManager<MockFirmwareWriter> {
+        let identity = test_identity();
+        let mut manager = OtaManager::new(MockFirmwareWriter::new(4096), identity.config());
+        let mut response = [0u8; 13];
+        response[1..3].copy_from_slice(&identity.manufacturer_code.to_le_bytes());
+        response[3..5].copy_from_slice(&identity.image_type.to_le_bytes());
+        response[5..9].copy_from_slice(&file_version(2, 0, 1).to_le_bytes());
+        response[9..13].copy_from_slice(&1024u32.to_le_bytes());
+        manager.start_query();
+        manager.handle_incoming(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &response, None);
+        manager.accept_ota();
+        manager.handle_incoming(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &response, None);
+        assert!(matches!(manager.state(), OtaState::Downloading { .. }));
+        manager
+    }
+
+    fn no_reset() -> ! {
+        panic!("reset")
+    }
+
+    #[test]
+    fn a_running_download_is_abandoned_when_the_supply_sags() {
+        static SUPPLY: SupplyLatch = SupplyLatch::new();
+        let mut lifecycle = FlowerOtaLifecycle::new(Channel::Own, &SUPPLY, no_reset);
+
+        let mut idle = OtaManager::new(MockFirmwareWriter::new(4096), test_identity().config());
+        assert!(!lifecycle.abandon_on_low_supply(&mut idle));
+
+        SUPPLY.record(OTA_MIN_SUPPLY_MV);
+        let mut manager = downloading_manager();
+        assert!(!lifecycle.abandon_on_low_supply(&mut manager));
+        assert!(matches!(manager.state(), OtaState::Downloading { .. }));
+
+        SUPPLY.record(OTA_MIN_SUPPLY_MV - 1);
+        assert!(lifecycle.abandon_on_low_supply(&mut manager));
+        assert_eq!(manager.state(), OtaState::Idle);
+        assert!(!manager.is_suspended());
     }
 
     #[test]

@@ -197,8 +197,16 @@ The firmware contains a Zigbee OTA Upgrade client (zigbee-runtime
     Image Notify from the server triggers a query too.
   - **Offers:** declined while the last compensated supply reading is below
     2.5 V, or before the first reading.
-  - **During a download:** fast poll. The device returns to normal polling
-    2 minutes after the last OTA traffic.
+  - **Supply re-check:** the same 2.5 V limit applies while the session runs
+    and right before activation. Below it the download is abandoned, the
+    staged image is discarded and no upgrade request is written; the
+    server offers the image again later.
+  - **During a download:** fast poll (250 ms). The device returns to normal
+    polling 2 minutes after the last OTA traffic.
+  - **Lost blocks:** a block request is retried (2 s, then up to every 5 s)
+    until the 2-minute response timeout. If the server gives up, the staged
+    data is kept, and a new offer of the same image (same version and size)
+    resumes from where it stopped, until the next reset.
 - **Download path:** `mcuboot_image::SlotWriter` writes the image to the
   secondary slot through `storage::OtaFlash`. That view can erase and write
   only `0x41800..0x7F000`, never the running image or the persistent data.
@@ -406,7 +414,7 @@ that repository together.
 ### Stack budget
 
 RAM ends at `0x20009000`. The stack grows down from there to the end of
-`.bss`, which leaves about 17 KB in the `logs` build.
+`.bss`, which leaves about 17 KB (17,084 B) in the `logs` build.
 
 A first HIL join panicked because the stack had overflowed into `.bss`
 (`hal::time` state, RTT). The cause was the Embassy main task's poll frame:
@@ -454,7 +462,12 @@ over SWD. Measured on a LaunchPad (`koptserg,logs,paint-stack`, aa33151,
 | Reset of a joined device (resume / rejoin) | 12,156 B | 5,440 B |
 | ZHA reconfigure (bind, configure reporting, reports) | 9,072 B | 8,524 B |
 
-Not measured yet: rejoin after parent loss, OTA download and activation.
+The zigbee-rs MAC fix for late parent frames (eight pending-RX slots) added
+512 B of `.bss`. A full ZHA OTA download, activation and loader install on
+that build peaked at the same 12,156 B, leaving 4,928 B of the 17,084 B
+stack region.
+
+Not measured yet: rejoin after parent loss.
 
 ## Flashing
 
@@ -529,15 +542,21 @@ Each of these is unverified until run on a board:
    clock and power state handed over by MCUboot.
 4. **Flash erase and program from the running application** into the
    secondary slot while the radio is active, including lazy sector erase
-   timing against poll and ACK deadlines.
-5. **OTA download from Zigbee2MQTT and ZHA:**
+   timing against poll and ACK deadlines. A full ZHA download ran without
+   lost frames on a LaunchPad; timing margins are not measured.
+5. **OTA download from Zigbee2MQTT and ZHA.** ZHA is verified on a
+   LaunchPad (`own` channel, 2.0.0 → 2.0.1, a 241 KB file in about 33
+   minutes): download, Upgrade End, the request write, the reset, the loader
+   install and the device reporting 2.0.1. Still to check: Zigbee2MQTT,
+   resuming after a server abort, and:
    - block size 48 and fast poll;
    - Image Notify handling;
    - Upgrade End;
    - the request write;
    - the reset.
-6. **The loader copy**, with power cut at random points (resume), downgrade
-   and wrong-key rejection on hardware.
+6. **The loader copy.** An uninterrupted copy works on a LaunchPad. Still
+   to check: power cut at random points (resume), downgrade and wrong-key
+   rejection on hardware.
 7. **Migration from koptserg's firmware** (BEBE and BABA):
    - the OTA offer is accepted;
    - his MCUboot installs the image;
@@ -548,9 +567,8 @@ Each of these is unverified until run on a board:
    load.
 9. **Current consumption** while idle, during the download and during the
    loader copy.
-10. **Stack peak** over join, rejoin after parent loss, OTA download and
-    the ZCL interview: paint the stack and read the low-water mark through
-    SWD.
+10. **Stack peak** after a rejoin following parent loss (join, reset, ZCL
+    interview and OTA are measured; see Stack budget).
 11. **Commissioned state retained** across an `own`-channel upgrade (rejoin
     without a new association).
 

@@ -124,7 +124,9 @@ jobs:
       - name: Build explicit no-SDK fallback
         working-directory: firmware
         run: |
-          env -u CC2340_SDK_DIR cargo build --release --locked --target-dir target/fallback
+          # `quiet` (a default feature) compiles the marker log line out.
+          env -u CC2340_SDK_DIR cargo build --release --locked --target-dir target/fallback \
+            --no-default-features --features koptserg,logs
           ELF=target/fallback/thumbv6m-none-eabi/release/cc2340-flower
           if ! grep -aFq 'radio firmware unavailable' "$ELF"; then
             echo "fallback image is missing its unavailable-radio marker" >&2
