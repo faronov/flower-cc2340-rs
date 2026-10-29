@@ -132,10 +132,6 @@ jobs:
             echo "fallback image is missing its unavailable-radio marker" >&2
             exit 1
           fi
-          if grep -aFq 'TI SimpleLink Low Power F3 SDK cc23x0r5/rf_patches' "$ELF"; then
-            echo "fallback image unexpectedly contains the SDK radio marker" >&2
-            exit 1
-          fi
       - name: Check out pinned TI radio sources
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -159,15 +155,19 @@ jobs:
           cargo build --release --locked --target-dir target/sdk
           cargo build --release --locked --no-default-features --features diyzi,quiet \
             --target-dir target/sdk-diyzi
-      - name: Check SDK marker, layout, AES and role gates
+      - name: Check radio images, layout, AES and role gates
         run: |
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          SDK=.ci/simplelink-lowpower-f3-sdk
+          # Log strings are compiled out, so the radio images are the marker.
+          if python3 tools/check_radio_firmware.py "$SDK" \
+              firmware/target/fallback/thumbv6m-none-eabi/release/cc2340-flower 2>/dev/null; then
+            echo "fallback image unexpectedly contains the SDK radio images" >&2
+            exit 1
+          fi
           for VARIANT in sdk sdk-diyzi; do
             ELF=firmware/target/$VARIANT/thumbv6m-none-eabi/release/cc2340-flower
-            if ! grep -aFq 'TI SimpleLink Low Power F3 SDK cc23x0r5/rf_patches' "$ELF"; then
-              echo "$VARIANT image is missing the pinned radio-firmware marker" >&2
-              exit 1
-            fi
+            python3 tools/check_radio_firmware.py "$SDK" "$ELF"
             LAYOUT="$("$NM" -n "$ELF")"
             if ! grep -q '^00004000 A _primary_slot_start$' <<<"$LAYOUT" ||
                ! grep -q '^00041800 A _secondary_slot_start$' <<<"$LAYOUT" ||
