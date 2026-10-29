@@ -810,7 +810,7 @@ mod tests {
         let mut response = [0u8; 13];
         response[1..3].copy_from_slice(&identity.manufacturer_code.to_le_bytes());
         response[3..5].copy_from_slice(&identity.image_type.to_le_bytes());
-        response[5..9].copy_from_slice(&file_version(2, 0, 1).to_le_bytes());
+        response[5..9].copy_from_slice(&(FILE_VERSION + 1).to_le_bytes());
         response[9..13].copy_from_slice(&1024u32.to_le_bytes());
         manager.start_query();
         manager.handle_incoming(CMD_QUERY_NEXT_IMAGE_RESPONSE.0, &response, None);

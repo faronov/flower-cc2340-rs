@@ -13,10 +13,11 @@ repository holds only the board wiring, the product policy and the firmware
 composition root. No TI C code is linked. TI's radio microcode and settings
 are imported as data at build time.
 
-> **Status: compiles and is host-tested only.** Neither the firmware nor the
-> bootloader has run on a flower board, and no OTA upgrade has been performed
-> on hardware. Every register sequence and the whole OTA/boot path still need
-> hardware gates (see [Hardware checklist](#hardware-checklist)).
+> **Status: runs on a CC2340R5 LaunchPad, not yet on a flower board.** The
+> bootloader, joining, ZHA reporting and a full ZHA OTA upgrade (download,
+> loader install, rejoin) work on a LaunchPad. The flower board's sensors,
+> LEDs and battery behaviour are still unverified (see
+> [Hardware checklist](#hardware-checklist)).
 
 ## Layout
 
@@ -236,7 +237,7 @@ advertised OTA identity differ:
   manufacturer code, not an assigned one. Coordinators match OTA files only
   by the code, image type and version, so the `own` channel works anyway.
 - **File version.** The OTA file version is `0x25MMmmpp`, from the
-  workspace version `MM.mm.pp` (currently 2.0.0, so `0x25020000`). It is
+  workspace version `MM.mm.pp` (currently 2.0.2, so `0x25020002`). It is
   newer than every koptserg release: `0x24000013` (koptserg) and
   `0x24100013` (DIYZi) are the highest. The MCUboot image version is the
   same `MM.mm.pp`. It starts at 2.0.0 because koptserg signs 1.0.0 and
@@ -488,6 +489,34 @@ erase main-flash sectors only.
 Program the bootloader and the image together: the application alone at
 `0x4100` does not start without a loader at `0x0`.
 
+## Current consumption
+
+Measured on a CC2340R5 LaunchPad (LP-EM-CC2340R5) powered at 3.3 V by its
+XDS110 EnergyTrace, with the `quiet` build (logs off) and no sensors fitted.
+EnergyTrace is not a calibrated instrument; treat the figures as estimates.
+A flower board adds its sensors and the CR2032's voltage drop.
+
+| State | Duration | Mean current | Charge |
+|---|---:|---:|---:|
+| Joined, idle between polls | — | about 1–3 µA | — |
+| Fast poll (250 ms) | — | about 0.67 mA | — |
+| OTA download, 190 KB, ZHA | 22 min | 2.48 mA (peaks about 12 mA) | 0.91 mAh |
+| Image check in the application (SHA-256, P-256) | 3.3 s | 7.0 mA | 6 µAh |
+| Loader: check, copy to primary, check | 10 s | 3.4 mA | 9.5 µAh |
+| After the new image starts: rejoin and coordinator traffic | 114 s | 1.86 mA | 59 µAh |
+| Fast poll before returning to normal polling | 125 s | 0.72 mA | 25 µAh |
+| **Whole update** | **about 26 min** | | **about 1.0 mAh** |
+
+- **Battery cost:** one update takes about 1 mAh, roughly 0.5 % of a
+  CR2032's nominal 220 mAh. At a 2.5 mA mean with 10–12 mA radio peaks, a
+  coin cell delivers less than its nominal capacity, so the real share is
+  somewhat higher.
+- **Download time:** the download is radio-bound (block requests in fast
+  poll), so its charge scales with the image size and the coordinator's
+  response time.
+- **Low supply:** the OTA policy declines and abandons downloads below
+  2.5 V (see [OTA and bootloaders](#ota-and-bootloaders)).
+
 ## Limitations
 
 - **Hardware validation is partial.** On a CC2340R5 LaunchPad, the
@@ -545,9 +574,10 @@ Each of these is unverified until run on a board:
    timing against poll and ACK deadlines. A full ZHA download ran without
    lost frames on a LaunchPad; timing margins are not measured.
 5. **OTA download from Zigbee2MQTT and ZHA.** ZHA is verified on a
-   LaunchPad (`own` channel, 2.0.0 → 2.0.1, a 241 KB file in about 33
-   minutes): download, Upgrade End, the request write, the reset, the loader
-   install and the device reporting 2.0.1. Still to check: Zigbee2MQTT,
+   LaunchPad (`own` channel): 2.0.0 → 2.0.1 (a 241 KB file in about 33
+   minutes) and 2.0.1 → 2.0.2 (a 190 KB file in 22 minutes, logs off):
+   download, Upgrade End, the request write, the reset, the loader install
+   and the device reporting the new version. Still to check: Zigbee2MQTT,
    resuming after a server abort, and:
    - block size 48 and fast poll;
    - Image Notify handling;
@@ -565,8 +595,8 @@ Each of these is unverified until run on a board:
    - a second migrate-channel update.
 8. **BATMON battery guard** at about 2.5 V on a real CR2032 under radio
    load.
-9. **Current consumption** while idle, during the download and during the
-   loader copy.
+9. **Current consumption** on a flower board with a CR2032. The LaunchPad
+   figures are in [Current consumption](#current-consumption).
 10. **Stack peak** after a rejoin following parent loss (join, reset, ZCL
     interview and OTA are measured; see Stack budget).
 11. **Commissioned state retained** across an `own`-channel upgrade (rejoin
