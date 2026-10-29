@@ -186,6 +186,21 @@ jobs:
               exit 1
             fi
           done
+      - name: Stack frame gate (main task poll frame)
+        working-directory: firmware
+        env:
+          CC2340_SDK_DIR: ${{ github.workspace }}/.ci/simplelink-lowpower-f3-sdk
+          RUSTFLAGS: -Z emit-stack-sizes
+        run: |
+          cargo build --release --locked --no-default-features --features koptserg,logs \
+            --target-dir target/stack-sizes
+          # The direct-call chain is informational (indirect calls are not
+          # followed); only the main task frame is a hard gate.
+          python3 ../tools/stack_sizes.py \
+            target/stack-sizes/thumbv6m-none-eabi/release/cc2340-flower \
+            --top 15 --max-main-frame 1536 --chain --through nlme_network_discovery \
+            --objdump "$(find "$(rustc --print sysroot)" -name llvm-objdump -print -quit)" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Sign and package (migrate + test-signed own)
         run: |
           for VARIANT in koptserg diyzi; do

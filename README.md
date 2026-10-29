@@ -403,6 +403,46 @@ It refuses a full-flash HEX whose loader trusts another key than
 `master`, run `cargo update -p zigbee-runtime`, which updates all crates from
 that repository together.
 
+### Stack budget
+
+RAM ends at `0x20009000`. The stack grows down from there to the end of
+`.bss`, which leaves about 17 KB in the `logs` build.
+
+A first HIL join panicked because the stack had overflowed into `.bss`
+(`hal::time` state, RTT). The cause was the Embassy main task's poll frame:
+it was 10,776 B, because the journal, profile, device and `SensorApp` were
+built by value inside `async fn main`.
+
+`firmware/src/main.rs` now works as follows:
+
+- `setup()` is a non-async, `#[inline(never)]` function. It runs once,
+  guarded by `board::take()`.
+- It builds every long-lived object in place, in a function-local
+  `static MaybeUninit` slot (`place!`), and returns `&'static mut FlowerApp`.
+- The construction temporaries are popped before the stack is used for
+  joining.
+- `main` keeps only `initialize().await` and the step loop. Its poll frame
+  is about 0.8 KB.
+
+`tools/stack_sizes.py` reads `.stack_sizes` from a
+`RUSTFLAGS="-Z emit-stack-sizes"` build:
+
+```sh
+cd firmware
+env CC2340_SDK_DIR=… RUSTFLAGS="-Z emit-stack-sizes" cargo build --release --locked \
+  --no-default-features --features koptserg,logs --target-dir target/stack-sizes
+python3 ../tools/stack_sizes.py target/stack-sizes/thumbv6m-none-eabi/release/cc2340-flower \
+  --max-main-frame 1536 --chain --through nlme_network_discovery
+```
+
+CI fails when the main frame exceeds 1.5 KB.
+
+`--chain` adds up frames along direct calls and cuts recursion. It does not
+follow indirect calls, so it is an estimate and not a proof. Its figure for
+the deepest stack-protocol path (secure rejoin into the security journal,
+inside zigbee-rs) is still larger than the stack region. Reducing those
+frames is zigbee-rs work; see Limitations.
+
 ## Flashing
 
 **Untested.** Use TI UniFlash or another CC2340R5-capable SWD tool, and
@@ -424,7 +464,15 @@ Program the bootloader and the image together: the application alone at
 
 ## Limitations
 
-- **No hardware validation.** See the checklist below.
+- **Hardware validation is partial.** On a CC2340R5 LaunchPad, the
+  bootloader starts, publishes `LoaderInfo` and jumps to the application
+  (VTOR `0x4100`). Everything else is open; see the checklist below.
+- **Stack:** the main task frame is fixed (see Stack budget). The static
+  direct-call estimate for the deepest rejoin path is still about 6 KB more
+  than the stack region. It depends on frame sizes inside zigbee-rs (BDB
+  steering, secure rejoin, the security journal replay cache, NWK discovery,
+  the sensor-sed control loop). Confirm the real peak on hardware by painting
+  the stack, and shrink those frames upstream.
 - **Soil readings:** the calibration lines come from the reference
   firmware's measurements. Readings from this ADC path have not been
   compared with that firmware.
@@ -455,8 +503,9 @@ Each of these is unverified until run on a board:
    - LED polarity;
    - standby with DIO20 wake;
    - reboot-on-leave.
-2. **`bootloader/` starts at reset from the CCFG default.** Check its LED
-   indication, P-256 verification time, and the jump to `0x4100` (VTOR, MSP).
+2. **`bootloader/` starts at reset from the CCFG default.** The start, the
+   `LoaderInfo` record and the jump to `0x4100` are verified on a LaunchPad.
+   Still check its LED indication, P-256 verification time, and the jump to `0x4100` (VTOR, MSP).
    With an invalid primary and no request, check the red blink, SHUTDOWN and
    SW1 wake.
 3. **The application under koptserg's MCUboot:** `__pre_init`, VTOR, and
@@ -482,7 +531,10 @@ Each of these is unverified until run on a board:
    load.
 9. **Current consumption** while idle, during the download and during the
    loader copy.
-10. **Commissioned state retained** across an `own`-channel upgrade (rejoin
+10. **Stack peak** over join, rejoin after parent loss, OTA download and
+    the ZCL interview: paint the stack and read the low-water mark through
+    SWD.
+11. **Commissioned state retained** across an `own`-channel upgrade (rejoin
     without a new association).
 
 ## License
