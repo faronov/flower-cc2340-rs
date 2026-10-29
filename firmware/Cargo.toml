@@ -21,6 +21,9 @@ quiet = ["log/release_max_level_off"]
 # would not fit the slot). For release builds replace `quiet`:
 #   --no-default-features --features koptserg,logs
 logs = ["dep:rtt-target", "log/release_max_level_warn"]
+# Fill the stack with 0xCCCCCCCC at reset so its high-water mark can be read
+# over SWD (lowest address below 0x20009000 that is no longer 0xCC).
+paint-stack = ["cortex-m-rt/paint-stack"]
 
 [dependencies]
 cc2340-flower-product.workspace = true

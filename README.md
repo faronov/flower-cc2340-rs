@@ -443,6 +443,19 @@ the deepest stack-protocol path (secure rejoin into the security journal,
 inside zigbee-rs) is still larger than the stack region. Reducing those
 frames is zigbee-rs work; see Limitations.
 
+The `paint-stack` feature fills the stack with `0xCC` at reset. The high-water
+mark is the lowest address below `0x20009000` that is no longer `0xCC`, read
+over SWD. Measured on a LaunchPad (`koptserg,logs,paint-stack`, aa33151,
+17,596 B of stack):
+
+| Path | Peak depth | Free |
+|---|---|---|
+| Factory-new join (discovery, steering, interview) | 11,076 B | 6,520 B |
+| Reset of a joined device (resume / rejoin) | 12,156 B | 5,440 B |
+| ZHA reconfigure (bind, configure reporting, reports) | 9,072 B | 8,524 B |
+
+Not measured yet: rejoin after parent loss, OTA download and activation.
+
 ## Flashing
 
 **Untested.** Use TI UniFlash or another CC2340R5-capable SWD tool, and
@@ -466,13 +479,17 @@ Program the bootloader and the image together: the application alone at
 
 - **Hardware validation is partial.** On a CC2340R5 LaunchPad, the
   bootloader starts, publishes `LoaderInfo` and jumps to the application
-  (VTOR `0x4100`). Everything else is open; see the checklist below.
+  (VTOR `0x4100`). The application joins ZHA as `zigbee-rs CC2340-Flower`
+  with Basic, Power Configuration, Identify, Temperature, Soil Moisture and
+  the OTA client (no sensors fitted, so no Illuminance), reports, and
+  resumes its network after a reset. OTA, migration and the board
+  peripherals are open; see the checklist below.
 - **Stack:** the main task frame is fixed (see Stack budget). The static
   direct-call estimate for the deepest rejoin path is still about 6 KB more
-  than the stack region. It depends on frame sizes inside zigbee-rs (BDB
-  steering, secure rejoin, the security journal replay cache, NWK discovery,
-  the sensor-sed control loop). Confirm the real peak on hardware by painting
-  the stack, and shrink those frames upstream.
+  than the stack region. The painted-stack peaks measured on hardware are
+  well below it (at least 5.4 KB free, see Stack budget), but rejoin after
+  parent loss and OTA are not measured yet. The large frames are inside
+  zigbee-rs and should still be shrunk upstream.
 - **Soil readings:** the calibration lines come from the reference
   firmware's measurements. Readings from this ADC path have not been
   compared with that firmware.
